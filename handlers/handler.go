@@ -4,25 +4,22 @@ import (
 	"fmt"
 	"github.com/869413421/wechatbot/config"
 	"github.com/869413421/wechatbot/pkg/logger"
-	"github.com/869413421/wechatbot/service"
 	"github.com/eatmoreapple/openwechat"
+	"github.com/patrickmn/go-cache"
 	"github.com/skip2/go-qrcode"
 	"log"
 	"runtime"
+	"strings"
+	"time"
 )
+
+var c = cache.New(config.LoadConfig().SessionTimeout, time.Minute*5)
 
 // MessageHandlerInterface 消息处理接口
 type MessageHandlerInterface interface {
-	handle(*openwechat.Message) error
-	ReplyText(*openwechat.Message) error
+	handle() error
+	ReplyText() error
 }
-
-type HandlerType string
-
-const (
-	GroupHandler = "group"
-	UserHandler  = "user"
-)
 
 // QrCodeCallBack 登录扫码回调，
 func QrCodeCallBack(uuid string) {
@@ -32,40 +29,30 @@ func QrCodeCallBack(uuid string) {
 	} else {
 		log.Println("login in linux")
 		url := "https://login.weixin.qq.com/l/" + uuid
-		log.Printf("如果二维码无法扫描，请尝试请复制链接到浏览器：%s", url)
+		log.Printf("如果二维码无法扫描，请缩小控制台尺寸，或更换命令行工具，缩小二维码像素")
 		q, _ := qrcode.New(url, qrcode.High)
 		fmt.Println(q.ToSmallString(true))
 	}
 }
 
-// handlers 所有消息类型类型的处理器
-var handlers map[HandlerType]MessageHandlerInterface
-var UserService service.UserServiceInterface
+func NewHandler() (msgFunc func(msg *openwechat.Message), err error) {
+	dispatcher := openwechat.NewMessageMatchDispatcher()
 
-func init() {
-	handlers = make(map[HandlerType]MessageHandlerInterface)
-	handlers[GroupHandler] = NewGroupMessageHandler()
-	handlers[UserHandler] = NewUserMessageHandler()
-	UserService = service.NewUserService()
-}
-
-// Handler 全局处理入口
-func Handler(msg *openwechat.Message) {
-	defer func() {
-		err := recover()
-		if err != nil {
-			logger.Warning(fmt.Sprintf("handler recover error: %v", err))
-		}
-	}()
+	// 清空会话
+	dispatcher.RegisterHandler(func(message *openwechat.Message) bool {
+		return strings.Contains(message.Content, config.LoadConfig().SessionClearToken)
+	}, TokenMessageContextHandler())
 
 	// 处理群消息
-	if msg.IsSendByGroup() {
-		handlers[GroupHandler].handle(msg)
-		return
-	}
+	dispatcher.RegisterHandler(func(message *openwechat.Message) bool {
+		return message.IsSendByGroup()
+	}, GroupMessageContextHandler())
 
 	// 好友申请
-	if msg.IsFriendAdd() {
+	dispatcher.RegisterHandler(func(message *openwechat.Message) bool {
+		return message.IsFriendAdd()
+	}, func(ctx *openwechat.MessageContext) {
+		msg := ctx.Message
 		if config.LoadConfig().AutoPass {
 			_, err := msg.Agree("")
 			if err != nil {
@@ -73,8 +60,12 @@ func Handler(msg *openwechat.Message) {
 				return
 			}
 		}
-	}
+	})
 
 	// 私聊
-	handlers[UserHandler].handle(msg)
+	// 获取用户消息处理器
+	dispatcher.RegisterHandler(func(message *openwechat.Message) bool {
+		return !(strings.Contains(message.Content, config.LoadConfig().SessionClearToken) || message.IsSendByGroup() || message.IsFriendAdd())
+	}, UserMessageContextHandler())
+	return openwechat.DispatchMessage(dispatcher), nil
 }
